@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+# coding: utf-8
+# Version: 
+# Dependencies on zabbix-agent2 on hostname 
+         
+  
+from pyzabbix import ZabbixAPI
+import sys
+import argparse
+
+"""
+This is a script to add a web scenario with Application tag and HTTP status check
+"""
+
+def authentication(server_domain, user, password):
+    if server_domain and user and password:
+        ZABBIX_SERVER = server_domain
+        zapi = ZabbixAPI(ZABBIX_SERVER)
+        try:
+            # Login to the Zabbix API
+            zapi.login(user, password)
+            return zapi
+        except Exception as e:
+            print(f"Authentication error: {e}")
+            sys.exit(1)
+    else:
+        print('Zabbix Server domain, user and password are required')
+        sys.exit(1)
+
+def get_host_inform(zapi, hostname):
+    try:
+        hosts = zapi.host.get(filter={'host': hostname}, selectInterfaces=["interfaceid"], output=['host', 'hostid', 'interfaces'])
+        if not hosts:
+            print(f'Host "{hostname}" not found')
+            sys.exit(1)
+        return hosts[0]
+    except Exception as e:
+        print(f"Error getting host ID: {e}")
+        sys.exit(1)
+
+
+
+def Create_Get_Cert_Inform_Item(zapi, domain, hostname, project_code):
+    # 
+    
+    host_inform = get_host_inform(zapi, hostname)
+    hostid = host_inform['hostid']
+    name = '[' + project_code + ']' + domain + '_Cert'
+    cert_key = 'web.certificate.get[' + domain + ']'
+    # 
+    request = zapi.item.get(filter={"name": name, "hostids": hostid})
+    if request:
+        print('Item ', name,' already exists on host ', hostname)
+        sys.exit(1)
+    
+    try:
+        # create item
+        params = {
+            "name": name  ,
+            "hostid": hostid,
+            "delay": '24h',
+            "key_": cert_key,
+            "type": 0,
+            "history": 0,
+            "value_type": 4,
+            "interfaceid": host_inform["interfaces"][0]["interfaceid"],
+            "tags": [{  # 
+                "tag": "component",
+                "value": "raw"
+            }],
+        }
+        
+        response = zapi.item.create(params)
+        print(f"Successfully created item '{name}' on host '{hostname}'")
+        
+        #return response
+    except Exception as e:
+        print(f"Error creating item: {e}")
+        sys.exit(1)
+    
+    try:
+        # create sub item -> Cert expration item 
+        master_itemid = zapi.item.get(filter={'hostid': hostid, 'name': name}, output=['itemid'])[0]['itemid']
+        Sub_Item_name =  domain + '-cert-Expires-On'
+        Sub_Item_key = domain + '.cert.not.after'
+        Sub_Item_Type = '18'
+        Sub_Item_History = '7d'
+        Sub_Item_Trends = '60d'
+        Sub_Value_Type = '3'
+        Sub_Item_Unit = 'unixtime'
+        Proprocess_Param = '$.x509.not_after.timestamp'
+        Expration_key = Sub_Item_key
+        
+
+        
+        response_cert_expiration = Create_Cert_Sub_Item(zapi, domain, hostname, hostid,master_itemid, Sub_Item_name,  Sub_Item_key, Sub_Item_Type, Sub_Item_History, Sub_Item_Trends, Sub_Value_Type,Sub_Item_Unit , Proprocess_Param )
+
+        # create sub item -> Cert Issuer item 
+        Sub_Item_name =  domain + '-Cert-Issuer'
+        Sub_Item_key = domain + '.cert.issuer'
+        Sub_Item_Trends = '0'
+        Sub_Value_Type = '4'
+        Proprocess_Param = '$.x509.issuer'
+        Issuer_key = Sub_Item_key
+
+        response_cert_issuer = Create_Cert_Sub_Item(zapi, domain, hostname, hostid,master_itemid, Sub_Item_name,  Sub_Item_key, Sub_Item_Type, Sub_Item_History, Sub_Item_Trends, Sub_Value_Type,Sub_Item_Unit , Proprocess_Param )
+        
+
+        #print(f"Successfully created item '{name}' on host '{hostname}'")
+
+        #Create trigger
+        Issuer = "CN=R10,O=Let" + "'" + "s Encrypt,C=US"
+        Trigger_Name = '[' + project_code + ']' + domain + '_Cert-expires-soon_less_than_{$CERT.EXPIRY.INFORM}_days'
+        Expression = '(last(/' + hostname + '/' + Expration_key + ') - now() ) / 86400 < {$CERT.EXPIRY.INFORM} and last(/' + hostname + '/' + Issuer_key + ') <> ' + '"' + Issuer + '"'
+        Priority = 1
+        create_trigger(zapi,  domain,  Expression, Trigger_Name , Priority)
+
+        Trigger_Name = '[' + project_code + ']' + domain + '_Cert-expires-soon_less_than_{$CERT.EXPIRY.WARN}_days'
+        Expression = '(last(/' + hostname + '/' + Expration_key + ')- now() ) / 86400 < {$CERT.EXPIRY.WARN}'
+        Priority = 2
+        create_trigger(zapi,  domain,  Expression, Trigger_Name , Priority)
+
+
+        return response_cert_issuer,response_cert_expiration
+    except Exception as e:
+        print(f"Error creating item: {e}")
+        sys.exit(1)
+
+
+
+        
+def Create_Cert_Sub_Item(zapi, domain, hostname, hostid,master_itemid, Sub_Item_name,  Sub_Item_key,  Sub_Item_Type, Sub_Item_History, Sub_Item_Trends, Sub_Value_Type, Sub_Item_Unit , Proprocess_Param):
+    # 
+    #master_item_name = name
+  
+   
+    #print (master_itemid)
+    request = zapi.item.get(filter={"name": Sub_Item_name, "hostids": hostid})
+    if request:
+        print('Item ', Sub_Item_name,' already exists on host ', hostname)
+        sys.exit(1)
+    
+    try:
+        # create item
+        params = {
+            "name": Sub_Item_name ,
+            "hostid": hostid,
+            "units": Sub_Item_Unit,
+            "key_": Sub_Item_key,
+            "type": Sub_Item_Type,
+            "history": Sub_Item_History,
+            "trends": Sub_Item_Trends,
+            "value_type": Sub_Value_Type,
+            "master_itemid": master_itemid ,
+            "tags": [{  # 
+                "tag": "component",
+                "value": "cert"
+            }],
+            "preprocessing": [{
+                "type": 12,
+                "error_handler": 0,
+                "error_handler_params": "",
+                'params': Proprocess_Param,
+            }]
+        }
+        
+        response = zapi.item.create(params)
+        print(f"Successfully created item '{Sub_Item_name}' on host '{hostname}'")
+        #create_trigger(zapi,  domain, hostname,item_name)
+        return response
+    except Exception as e:
+        print(f"Error creating item: {e}")
+        sys.exit(1)
+
+
+
+
+
+def create_by_file(zapi, hostname,  filename):
+    #
+    host_inform = get_host_inform(zapi, hostname)
+    hostid = host_inform['hostid']
+    
+    try:
+        with open(filename, 'r', encoding='utf-8') as file_to_parse:
+            for line_number, line in enumerate(file_to_parse, 1):
+                # parameter： item name, domain
+                values = line.strip().split(',')
+                if len(values) < 2:
+                    print(f"Line {line_number}: Needs at least 2 parameters (item name and domain)")
+                    continue
+                
+                                
+                
+                project_code = values[0].strip()
+                domain = values[1].strip()
+                
+                
+                Create_Get_Cert_Inform_Item(
+                    zapi, 
+                    domain, 
+                    hostname, 
+                    project_code
+                    
+                )
+                    
+    except IOError as e:
+        print(f"Could not open file {filename}: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error processing file: {e}")
+        sys.exit(1)
+
+def create_trigger(zapi,  domain,  Expression, Trigger_Name , Priority):
+    try:
+        # 
+  
+        
+        
+        
+        trigger = zapi.trigger.create(
+            description = Trigger_Name,
+            
+                    
+            expression= Expression,
+            manual_close = 1,
+            priority = Priority 
+            #priority:    Severity of the trigger.
+            #Possible values:         #0 - (default) not classified;  #1 - information;  #2 - warning;  #3 - average;  #4 - high;  #5 - disaster.
+        )
+
+        
+        print(f"Successfully created trigger for {domain}")
+        return trigger
+    except Exception as e:
+        print(f"Error creating trigger: {e}")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Create Zabbix web scenarios with HTTP status checks')
+    parser.add_argument("-z", "--zabbix", dest="server_domain", required=True, help='domain for Zabbix Server')
+    parser.add_argument('-u', '--user', dest='user', required=True, help='Zabbix API user')
+    parser.add_argument('-p', '--password', dest='password', required=True, help='Zabbix API password')
+    parser.add_argument('-H', '--hostname', dest='hostname', required=True, help='Hostname in Zabbix')
+    
+    
+    # 
+    Cert_group = parser.add_mutually_exclusive_group(required=True)
+    Cert_group.add_argument('-f', '--file', dest='filename', help='CSV file containing Name of the Web Scenario,domain,StatusCodes')
+    Cert_group.add_argument('-d', '--domain', dest='domain', help='domain to monitor')
+   
+    
+
+    # 
+    
+    parser.add_argument('-c', '--project-code', dest='project_code', help='item name')
+   
+    
+    args = parser.parse_args()
+    
+    zapi = authentication(args.server_domain, args.user, args.password)
+    
+    if args.filename:
+        create_by_file(
+            zapi, 
+            args.hostname,
+            args.filename
+        )
+    else:
+        if not args.project_code:
+            parser.error("--project_code is required when not using --file")
+        
+        Create_Get_Cert_Inform_Item(
+            zapi, 
+           
+            args.domain, 
+            args.hostname, 
+            args.project_code
+                    
+        )
+        ###example  
+        ##   python.exe .\zabbix-URL-Cert-Expiration.py -z http://10.8.2.8/zabbix -H TKO-NMS-CORE_Agent -u Admin -p 'S&' -c su -d www.google.com
+        ##
+        ##python.exe .\zabbix-URL-Cert-Expiration.py -z http://10.8.2.8/zabbix -H TKO-NMS-CORE_Agent -u Admin -p 'S&'  -f .\domain-list.txt 
+
+
+        ###domain-list.txt
+        ##
+        ##sv, www.google.hk
+        ##ss, www.bing.com
