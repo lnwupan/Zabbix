@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+# Author:         
+# Mail:           
+  
+from pyzabbix import ZabbixAPI
+import sys
+import argparse
+
+"""
+This is a script to add a web scenario with Application tag and HTTP status check
+"""
+
+def authentication(server_domain, user, password):
+    if server_domain and user and password:
+        ZABBIX_SERVER = server_domain
+        zapi = ZabbixAPI(ZABBIX_SERVER)
+        try:
+            # Login to the Zabbix API
+            zapi.login(user, password)
+            return zapi
+        except Exception as e:
+            print(f"Authentication error: {e}")
+            sys.exit(1)
+    else:
+        print('Zabbix Server domain, user and password are required')
+        sys.exit(1)
+
+def get_host_inform(zapi, hostname):
+    try:
+        hosts = zapi.host.get(filter={'host': hostname}, selectInterfaces=["interfaceid"], output=['host', 'hostid', 'interfaces'])
+        if not hosts:
+            print(f'Host "{hostname}" not found')
+            sys.exit(1)
+        return hosts[0]
+    except Exception as e:
+        print(f"Error getting host ID: {e}")
+        sys.exit(1)
+
+def Create_Port_Monitor_Item(zapi, hostname, project_code, protocol, target_port, target_port_description, target_name, target_ip):
+    host_inform = get_host_inform(zapi, hostname)
+    hostid = host_inform['hostid']
+    name = f'[{project_code}]{protocol.upper()} Port {target_port}_{target_port_description} on {target_name}_{target_ip}'
+    item_key = f'net.{protocol.lower()}.service[{protocol.lower()},{target_ip},{target_port}]'
+    
+    # Check if item already exists
+    request = zapi.item.get(filter={"name": name, "hostids": hostid})
+    if request:
+        print(f'Item {name} already exists on host {hostname}')
+        sys.exit(1)
+    
+    try:
+        # Create item
+        params = {
+            "name": name,
+            "hostid": hostid,
+            "delay": '2m',
+            "key_": item_key,
+            "type": 3,  # Zabbix agent (active)
+            "history": '7d',
+            "trends": '90d',
+            "value_type": 3,  # numeric unsigned
+            "interfaceid": host_inform["interfaces"][0]["interfaceid"],
+            "tags": [{
+                "tag": "component",
+                "value": "Remote_Port_Check"
+            }],
+        }
+        
+        response = zapi.item.create(params)
+        print(f"Successfully created item '{name}' on host '{hostname}'")
+        
+        # Create trigger
+        Trigger_Name = f'[{project_code}]{protocol.upper()} Port {target_port}_{target_port_description} is Closed on {target_name}_{target_ip}'
+        Expression = f'count(/{hostname}/{item_key}, #3, "eq", "0" ) >= 2'
+        Priority = 1
+        create_trigger(zapi, Expression, Trigger_Name, Priority)
+        
+        return response
+    except Exception as e:
+        print(f"Error creating item: {e}")
+        sys.exit(1)
+
+def create_by_file(zapi, hostname, filename):
+    try:
+        with open(filename, 'r', encoding='utf-8') as file_to_parse:
+            for line_number, line in enumerate(file_to_parse, 1):
+                values = line.strip().split(',')
+                if len(values) < 6:
+                    print(f"Line {line_number}: Needs at least 6 parameters (project code, server name, server ip, protocol, port, port description)")
+                    continue
+                
+                project_code = values[0].strip()
+                target_name = values[1].strip()
+                target_ip = values[2].strip()
+                protocol = values[3].strip()
+                target_port = values[4].strip()
+                target_port_description = values[5].strip()
+                
+                Create_Port_Monitor_Item(
+                    zapi, 
+                    hostname, 
+                    project_code,
+                    protocol,
+                    target_port,
+                    target_port_description,
+                    target_name,
+                    target_ip
+                )
+                    
+    except IOError as e:
+        print(f"Could not open file {filename}: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error processing file: {e}")
+        sys.exit(1)
+
+def create_trigger(zapi, expression, trigger_name, priority):
+    try:
+        trigger = zapi.trigger.create(
+            description=trigger_name,
+            expression=expression,
+            manual_close=1,
+            priority=priority
+        )
+        print(f"Successfully created trigger '{trigger_name}'")
+        return trigger
+    except Exception as e:
+        print(f"Error creating trigger: {e}")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Create Zabbix port monitoring items')
+    parser.add_argument("-z", "--zabbix", dest="server_domain", required=True, help='URL for Zabbix Server')
+    parser.add_argument('-u', '--user', dest='user', required=True, help='Zabbix API user')
+    parser.add_argument('-p', '--password', dest='password', required=True, help='Zabbix API password')
+    parser.add_argument('-H', '--hostname', dest='hostname', required=True, help='Hostname in Zabbix')
+    
+    # Port monitoring parameters
+    parser.add_argument('-c', '--project-code', dest='project_code', help='Project code')
+    parser.add_argument('-t', '--target-server-name', dest='target_name', help='Target server name')
+    parser.add_argument('-o', '--port', dest='target_port', help='Target server port')
+    parser.add_argument('-x', '--protocol', dest='protocol', choices=['tcp', 'udp'], help='TCP/UDP protocol')
+    parser.add_argument('-s', '--port-description', dest='target_port_description', help='Target server port description')
+    
+    # File or single item mode
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('-f', '--file', dest='filename', help='CSV file containing port monitoring details')
+    group.add_argument('-a', '--target-server-ip', dest='target_ip', help='Target server IP address')
+    
+    args = parser.parse_args()
+    
+    zapi = authentication(args.server_domain, args.user, args.password)
+    
+    if args.filename:
+        create_by_file(zapi, args.hostname, args.filename)
+    else:
+        # Check required parameters for single item mode
+        required_params = [
+            args.project_code, 
+            args.target_name, 
+            args.target_port, 
+            args.protocol, 
+            args.target_port_description, 
+            args.target_ip
+        ]
+        
+        if not all(required_params):
+            parser.error("All parameters (-c, -t, -o, -x, -s, -a) are required when not using --file")
+        
+        Create_Port_Monitor_Item(
+            zapi,
+            args.hostname,
+            args.project_code,
+            args.protocol,
+            args.target_port,
+            args.target_port_description,
+            args.target_name,
+            args.target_ip
+        )
+
+
+
+        ###example  
+        ##python.exe .\zabbix-Port-Monitor.py -z 'http://zabbix.su.local/zabbix' -H Remotely-Port-Monitor -u Admin -p 'S&' -c us-if -t if-cms1 -o 1433 -x tcp -s https -a 17.18.7.25
+        ##
+        ##python.exe .\zabbix-Port-Monitor.py -z 'http://zabbix.su.local/zabbix' -H Remotely-Port-Monitor -u Admin -p 'S&' -f port-list.txt
+
+        ## port discovery:   nmap -T5 -Pn -PS Your-IP-Address | grep -i open
+
+        ###port-list.txt
+        ##
+        ##us-if, if-cms1, 17.18.7.25, tcp,  443, https
+        ##us-if, if-cms1,  17.18.7.25, tcp,  80, http
+        ##us-if, if-cms1,  17.18.7.25, udp,  53, dns
